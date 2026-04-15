@@ -1,0 +1,156 @@
+"""
+expand_addresses.py
+-------------------
+Post-processes the quarterly menu report CSV.
+
+Rows whose 'address' field contains multiple semicolon-separated addresses
+are expanded into one row per address:
+  - The first address keeps all original column values.
+  - Each additional address gets a new row with only 'address' filled in;
+    all other columns are left blank.
+
+Usage:
+    python expand_addresses.py
+    python expand_addresses.py --input quarterly_menu_report_Q4_2024.csv
+    python expand_addresses.py --input in.csv --output out.csv
+"""
+
+import csv
+import re
+import argparse
+from pathlib import Path
+
+FIELDS = ["ward", "menu_package", "address", "cost", "cost_numeric", "cost_share"]
+
+DEFAULT_IN  = "quarterly_menu_report_Q4_2024.csv"
+DEFAULT_OUT = "quarterly_menu_report_Q4_2024_expanded.csv"
+
+
+def fix_ampersand(addr):
+    """Ensure exactly one space on each side of &."""
+    return re.sub(r'\s*&\s*', ' & ', addr)
+
+
+def parse_range_address(addr):
+    """
+    Converts "ON E HURON ST FROM N MCCLURG CT (400 E) TO N LAKE SHORE DR (500 E)"
+    to "400-500 E Huron St".
+    Returns None if the address doesn't match this pattern.
+    """
+    cleaned = re.sub(r'[\u00A0\s]+', ' ', addr).strip()
+
+    street_match = re.search(r'ON\s+(.*?)\s+FROM', cleaned)
+    if not street_match:
+        return None
+
+    full_street = street_match.group(1)
+    blocks = re.findall(r'\(?(\d+)(?=\s[NSEW](?:\)|\s|$))', cleaned)
+
+    if len(blocks) < 2:
+        return None
+
+    street_clean = full_street.title()
+    # Fix title-cased ordinal suffixes: "72Nd" → "72nd", "86Th" → "86th"
+    street_clean = re.sub(r'(\d+)(St|Nd|Rd|Th)\b', lambda m: m.group(1) + m.group(2).lower(), street_clean)
+
+    return f"{blocks[0]}-{blocks[1]} {street_clean}"
+
+
+def normalize_address(addr):
+    """Apply all address normalizations."""
+    range_fmt = parse_range_address(addr)
+    if range_fmt:
+        return range_fmt
+    return fix_ampersand(addr)
+
+
+def expand(records):
+    expanded = []
+    for row in records:
+        addresses = [normalize_address(a.strip()) for a in row["address"].split(";") if a.strip()]
+
+        if len(addresses) <= 1:
+            row = dict(row)
+            row["address"] = addresses[0] if addresses else ""
+            expanded.append(row)
+            continue
+
+        # Split cost evenly across all addresses
+        n = len(addresses)
+        split_numeric = float(row["cost_numeric"]) / n if row["cost_numeric"] else ""
+        split_cost    = f"${split_numeric:,.2f}" if split_numeric != "" else ""
+
+        for addr in addresses:
+            expanded.append({
+                "ward":         row["ward"],
+                "menu_package": row["menu_package"] if addr == addresses[0] else "",
+                "address":      addr,
+                "cost":         split_cost,
+                "cost_numeric": f"{split_numeric:.2f}" if split_numeric != "" else "",
+            })
+
+    return expanded
+
+
+def add_ward_totals_and_cost_share(records):
+    """Compute ward totals once, add cost_share to each row, then append summary rows."""
+    from collections import defaultdict
+    ward_totals = defaultdict(float)
+    for row in records:
+        try:
+            ward_totals[row["ward"]] += float(row["cost_numeric"])
+        except (ValueError, TypeError):
+            pass
+
+    for row in records:
+        try:
+            ward_total = ward_totals[row["ward"]]
+            cost = float(row["cost_numeric"])
+            row["cost_share"] = f"{cost / ward_total:.6f}" if ward_total else ""
+        except (ValueError, TypeError):
+            row["cost_share"] = ""
+
+    summary_rows = []
+    for ward in sorted(ward_totals, key=lambda w: int(w) if str(w).isdigit() else w):
+        total = ward_totals[ward]
+        summary_rows.append({
+            "ward":         ward,
+            "menu_package": "WARD TOTAL",
+            "address":      "",
+            "cost":         f"${total:,.2f}",
+            "cost_numeric": f"{total:.2f}",
+            "cost_share":   "",
+        })
+    return records + summary_rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Expand semicolon-separated addresses into individual rows")
+    ap.add_argument("--input",  default=DEFAULT_IN)
+    ap.add_argument("--output", default=DEFAULT_OUT)
+    args = ap.parse_args()
+
+    in_path = Path(args.input)
+    if not in_path.exists():
+        raise SystemExit(f"Input file not found: {in_path}")
+
+    with open(in_path, newline="", encoding="utf-8") as f:
+        records = list(csv.DictReader(f))
+
+    before = len(records)
+    expanded = expand(records)
+    expanded = add_ward_totals_and_cost_share(expanded)
+    after = len(expanded)
+
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(expanded)
+
+    print(f"  Input rows  : {before:,}")
+    print(f"  Output rows : {after:,}  (+{after - before:,} from address expansion + ward totals)")
+    print(f"  Saved → {args.output}")
+
+
+if __name__ == "__main__":
+    main()
