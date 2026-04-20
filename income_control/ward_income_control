@@ -1,0 +1,141 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ward_median_income_spatial.R
+#
+# Estimates ward-level median household income by:
+#   1. Pulling ACS tract-level median income + population from tidycensus
+#   2. Downloading Chicago ward boundaries from the city's open data portal
+#   3. Spatially joining tracts to wards (area-weighted where tracts cross
+#      ward boundaries)
+#   4. Computing a population-weighted median income for each ward
+#
+# Output:
+#   ward_median_income_spatial.csv  — one row per ward with weighted median income
+# ─────────────────────────────────────────────────────────────────────────────
+
+library(tidycensus)
+library(dplyr)
+library(sf)
+library(readr)
+
+# census_api_key("YOUR_KEY_HERE", install = TRUE)  # run once
+
+
+# ── 1. ACS TRACT-LEVEL MEDIAN INCOME + POPULATION ────────────────────────────
+# B19013_001 = median household income
+# B01003_001 = total population (used as weight)
+#
+# Pull for all three years so ward income varies by year in your panel.
+# Cook County FIPS = 031, Illinois = 17.
+
+cat("Fetching ACS tract data for Cook County...\n")
+
+tract_sf <- get_acs(
+  geography = "tract",
+  variables = c(
+    median_income = "B19013_001",
+    population    = "B01003_001"
+  ),
+  state    = "IL",
+  county   = "Cook",
+  year     = 2023,
+  survey   = "acs5",
+  output   = "wide",
+  geometry = TRUE
+) %>%
+  select(
+    GEOID,
+    median_income = median_incomeE,
+    population    = populationE,
+    geometry
+  ) %>%
+  filter(!is.na(median_income), population > 0)
+
+cat(sprintf("Tracts loaded: %d\n", nrow(tract_sf)))
+
+
+# ── 2. LOAD CHICAGO WARD BOUNDARIES ──────────────────────────────────────────
+# Downloads the 2023 ward shapefile from Chicago's open data portal.
+# If you have a local shapefile, replace the URL with sf::st_read("path/to/file.shp")
+
+cat("\nLoading Chicago ward boundaries...\n")
+
+ward_sf <- sf::st_read(
+  "https://data.cityofchicago.org/resource/p293-wvbd.geojson",
+  quiet = TRUE
+) %>%
+  mutate(ward = as.integer(ward)) %>%
+  select(ward, geometry)
+
+cat(sprintf("Wards loaded: %d\n", nrow(ward_sf)))
+
+
+# ── 3. REPROJECT TO A COMMON CRS ─────────────────────────────────────────────
+# Illinois State Plane East (EPSG:3435) for accurate area computation
+
+tract_sf <- sf::st_transform(tract_sf, crs = 3435)
+ward_sf   <- sf::st_transform(ward_sf,  crs = 3435)
+
+
+# ── 4. AREA-WEIGHTED SPATIAL JOIN ────────────────────────────────────────────
+# Some census tracts straddle ward boundaries. We split them by intersection,
+# weight each fragment by its share of the original tract area, and assign
+# a proportional population to each ward fragment.
+
+cat("\nRunning area-weighted spatial intersection...\n")
+
+tract_sf <- tract_sf %>%
+  mutate(tract_area = as.numeric(sf::st_area(geometry)))
+
+intersected <- sf::st_intersection(tract_sf, ward_sf) %>%
+  mutate(
+    fragment_area = as.numeric(sf::st_area(geometry)),
+    area_weight   = fragment_area / tract_area,
+    pop_fragment  = population * area_weight
+  ) %>%
+  sf::st_drop_geometry() %>%
+  filter(pop_fragment > 0, !is.na(median_income))
+
+# Population-weighted mean of tract median incomes within each ward.
+# Note: averaging median incomes is an approximation — the true ward median
+# would require microdata. Population-weighted mean is the standard approach.
+ward_income <- intersected %>%
+  group_by(ward) %>%
+  summarise(
+    ward_median_income     = weighted.mean(median_income, w = pop_fragment, na.rm = TRUE),
+    ward_total_pop         = sum(pop_fragment, na.rm = TRUE),
+    n_tract_fragments      = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(ward_median_income_10k = ward_median_income / 10000) %>%
+  arrange(ward)
+
+
+# ── 5. DIAGNOSTICS ───────────────────────────────────────────────────────────
+
+cat("\n── Ward median income estimates ─────────────────────────────────────\n")
+cat(sprintf("Rows: %d | Unique wards: %d\n",
+            nrow(ward_income),
+            n_distinct(ward_income$ward)))
+cat(sprintf("Income range: $%.0f – $%.0f\n",
+            min(ward_income$ward_median_income, na.rm = TRUE),
+            max(ward_income$ward_median_income, na.rm = TRUE)))
+cat(sprintf("NAs: %d\n", sum(is.na(ward_income$ward_median_income))))
+cat("\nTop 5 highest-income wards:\n")
+ward_income %>%
+  slice_max(ward_median_income, n = 5) %>%
+  select(ward, ward_median_income, ward_total_pop) %>%
+  print()
+cat("\nBottom 5 lowest-income wards:\n")
+ward_income %>%
+  slice_min(ward_median_income, n = 5) %>%
+  select(ward, ward_median_income, ward_total_pop) %>%
+  print()
+view(ward_income)
+
+# ── 6. SAVE ───────────────────────────────────────────────────────────────────
+
+write_csv(ward_income, "ward_median_income_spatial.csv")
+cat("\nSaved: ward_median_income_spatial.csv\n")
+cat("\nTo join into your regression panel:\n")
+cat("  analysis <- analysis %>%\n")
+cat("    left_join(ward_income, by = 'ward')\n")
